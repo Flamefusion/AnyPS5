@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <list>
 #include <memory>
+#include <optional>
 #include <vector>
 #include "prx/libc/include/general/AtomicSharedPtr.hpp"
 
@@ -33,6 +34,23 @@ struct DrawProgram {
     std::uint32_t mergedPointer = 0;
     std::uint32_t hiddenUserWords = 0;
 };
+
+inline bool EmbeddedVertexFetch(const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& info) {
+    return info.has_value() && info->fetchEmbedded && info->resourcesNum != 0;
+}
+
+inline std::uint32_t VertexFetchWord(std::uint32_t reg, std::uint32_t firstUserSgpr) {
+    return reg + 8u - firstUserSgpr;
+}
+
+inline std::uint64_t VertexFetchTableWords(const ShaderRecompiler::ShaderVertexStageInfo& info, std::uint32_t firstUserSgpr) {
+    std::uint64_t words = 0;
+    for (const auto reg : {info.fetchBufferReg, info.fetchAttribReg}) {
+        const auto index = VertexFetchWord(reg, firstUserSgpr);
+        if (index < 64u) words |= std::uint64_t {1} << index;
+    }
+    return words;
+}
 
 struct DrawDecode {
     Graphics::State state;
