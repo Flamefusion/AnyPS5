@@ -170,10 +170,25 @@ void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
             variant->userDataMask = stageCapture.userDataMask;
             if (vertexInfos[i]) variant->vertexInfo = std::make_shared<const ShaderRecompiler::ShaderVertexStageInfo>(*vertexInfos[i]);
 
+            const bool relocateFetch = EmbeddedVertexFetch(vertexInfos[i]);
             std::vector<ShaderRecompiler::MemoryRegion> regions(stageCapture.regions.begin(), stageCapture.regions.end());
             for (const auto& read : decodeReads[i]) regions.push_back({read.address, std::as_bytes(std::span(read.bytes))});
             std::stable_sort(regions.begin(), regions.end(), [](const ShaderRecompiler::MemoryRegion& a, const ShaderRecompiler::MemoryRegion& b) { return a.guestAddress < b.guestAddress; });
-            tagVariantRuns(*variant, regions, stageCapture.userDataUse, decodeReads[i].empty() && (!vertexInfos[i] || vertexInfos[i]->resourcesNum == 0), programs[i].hiddenUserWords);
+            auto use = stageCapture.userDataUse;
+            if (relocateFetch) {
+                const auto bufferWord = static_cast<std::int32_t>(VertexFetchWord(vertexInfos[i]->fetchBufferReg, programs[i].firstUserSgpr));
+                const auto attribWord = static_cast<std::int32_t>(VertexFetchWord(vertexInfos[i]->fetchAttribReg, programs[i].firstUserSgpr));
+                std::vector<std::pair<std::uint64_t, std::int32_t>> fetchReads;
+                for (const auto& read : decodeReads[i]) {
+                    const auto origin = read.bytes.size() == 16 ? bufferWord : attribWord;
+                    for (std::size_t offset = 0; offset < read.bytes.size(); offset += sizeof(std::uint32_t)) fetchReads.emplace_back(read.address + offset, origin);
+                }
+                std::sort(fetchReads.begin(), fetchReads.end());
+                fetchReads.erase(std::unique(fetchReads.begin(), fetchReads.end()), fetchReads.end());
+                use.reads.insert(use.reads.end(), fetchReads.begin(), fetchReads.end());
+            }
+            const bool eligible = relocateFetch || (decodeReads[i].empty() && (!vertexInfos[i] || vertexInfos[i]->resourcesNum == 0));
+            tagVariantRuns(*variant, regions, use, eligible, programs[i].hiddenUserWords, relocateFetch ? VertexFetchTableWords(*vertexInfos[i], programs[i].firstUserSgpr) : 0);
             if (drawStageDataHits() && stageCapture.capture != nullptr && !stageCapture.capture->readTrace.leaves.empty()) recordStageDataPositions(*variant, *stageCapture.capture, decodeReads[i]);
             if (traceDrawCache() && entry != nullptr && matched[i] == nullptr && i < entry->stages.size()) {
                 const auto& variants = entry->stages[i];
