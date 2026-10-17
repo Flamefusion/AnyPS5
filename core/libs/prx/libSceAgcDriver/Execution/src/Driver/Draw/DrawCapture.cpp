@@ -188,7 +188,17 @@ void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
                 use.reads.insert(use.reads.end(), fetchReads.begin(), fetchReads.end());
             }
             const bool eligible = relocateFetch || (decodeReads[i].empty() && (!vertexInfos[i] || vertexInfos[i]->resourcesNum == 0));
-            tagVariantRuns(*variant, regions, use, eligible, programs[i].hiddenUserWords, relocateFetch ? VertexFetchTableWords(*vertexInfos[i], programs[i].firstUserSgpr) : 0);
+            const auto fetchWords = relocateFetch ? VertexFetchTableWords(*vertexInfos[i], programs[i].firstUserSgpr) : 0;
+            std::uint64_t unreadWords = 0;
+            if (variant->userDataMask != ~std::uint64_t {0} && !programs[i].snapshot->userDataTailRegister) {
+                const auto count = std::min<std::size_t>(programs[i].userData.size(), 64);
+                for (std::size_t w = programs[i].hiddenUserWords; w < count; ++w) {
+                    if ((variant->userDataMask >> w & 1u) == 0) unreadWords |= std::uint64_t {1} << w;
+                }
+                unreadWords &= ~(fetchWords | fetchWords << 1);
+            }
+            tagVariantRuns(*variant, regions, use, eligible, programs[i].hiddenUserWords, fetchWords | unreadWords);
+            variant->unreadWords = unreadWords & variant->relocatableWords;
             if (drawStageDataHits() && stageCapture.capture != nullptr && !stageCapture.capture->readTrace.leaves.empty()) recordStageDataPositions(*variant, *stageCapture.capture, decodeReads[i]);
             if (traceDrawCache() && entry != nullptr && matched[i] == nullptr && i < entry->stages.size()) {
                 const auto& variants = entry->stages[i];

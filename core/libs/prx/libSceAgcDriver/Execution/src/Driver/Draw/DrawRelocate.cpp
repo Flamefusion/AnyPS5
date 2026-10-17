@@ -33,6 +33,7 @@ std::uint64_t Driver::relocatedContentKey(const RelocatableUserWord& word, std::
         hash ^= mixed;
         hash *= 0x100000001b3ull;
     };
+    if (word.reads.empty()) return hash;
     mix(value & 3u);
     if (value == 0) {
         readable = false;
@@ -205,7 +206,7 @@ void Driver::relocateDrawEntry(const QueueState& queue, std::uint64_t alias, std
         }
         for (const auto& variant : donor->stages[i]) {
             if (variant == nullptr || variant->compiled == nullptr) continue;
-            const bool allowed = std::all_of(moves.begin(), moves.end(), [&](const Move& move) { return move.program != i || (move.index < 64 && (variant->relocatableWords >> move.index & 1u) != 0 && move.from != 0 && move.to != 0 && ((move.from ^ move.to) & 3u) == 0); });
+            const bool allowed = std::all_of(moves.begin(), moves.end(), [&](const Move& move) { return move.program != i || (move.index < 64 && (variant->relocatableWords >> move.index & 1u) != 0 && ((variant->unreadWords >> move.index & 1u) != 0 || (move.from != 0 && move.to != 0 && ((move.from ^ move.to) & 3u) == 0))); });
             if (!allowed) {
                 ++counters.refused;
                 continue;
@@ -214,6 +215,7 @@ void Driver::relocateDrawEntry(const QueueState& queue, std::uint64_t alias, std
             copy->runs = variant->runs;
             copy->runBases = variant->runBases;
             copy->relocatableWords = variant->relocatableWords;
+            copy->unreadWords = variant->unreadWords;
             copy->words = variant->words;
             copy->forgetSerial = variant->forgetSerial;
             copy->compiled = variant->compiled;
