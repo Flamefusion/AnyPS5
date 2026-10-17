@@ -3,6 +3,7 @@
 
 #include "RuntimeAbi.hpp"
 #include "PipelineSpecialization.hpp"
+#include "prx/libc/include/general/AtomicSharedPtr.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -647,7 +648,7 @@ struct PipelineIdentity {
 };
 
 struct ResultKeyMemo {
-    mutable std::atomic<std::shared_ptr<const std::vector<std::uint32_t>>> words;
+    mutable AtomicSharedPtr<const std::vector<std::uint32_t>> words;
     ResultKeyMemo() = default;
     ResultKeyMemo(const ResultKeyMemo&) {}
     ResultKeyMemo& operator=(const ResultKeyMemo&) {
