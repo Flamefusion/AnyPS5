@@ -4947,6 +4947,18 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
     }
     if (selected.empty()) return {};
+    static const bool reuseBindings = std::getenv("APS5_NO_DRAW_BINDINGS_REUSE") == nullptr;
+    if (reuseBindings && lastDrawBindingsKey.size() == selected.size()) {
+        bool same = true;
+        for (std::size_t index = 0; same && index < selected.size(); ++index) same = lastDrawBindingsKey[index] == DrawBindingsKey{selected[index], result->snapshots[index].buffer.get(), result->snapshots[index].address};
+        if (same) {
+            if (auto reused = lastDrawBindings.lock()) {
+                recorder.Keep(reused);
+                for (const auto& snapshot : reused->snapshots) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
+                return reused;
+            }
+        }
+    }
     Require(context.descriptorCache != nullptr, "draw snapshots require a descriptor cache");
     std::array<std::size_t, 2> described{};
     struct CountsStorage {};
@@ -5004,6 +5016,11 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
     recorder.Keep(result);
     for (const auto& snapshot : result->snapshots) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
+    if (reuseBindings) {
+        lastDrawBindingsKey.clear();
+        for (std::size_t index = 0; index < selected.size(); ++index) lastDrawBindingsKey.push_back({selected[index], result->snapshots[index].buffer.get(), result->snapshots[index].address});
+        lastDrawBindings = result;
+    }
     return result;
 }
 

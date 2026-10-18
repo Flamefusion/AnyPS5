@@ -546,6 +546,14 @@ private:
     };
     mutable std::vector<MovedWordBuffer> movedWordBuffers;
     mutable std::size_t movedWordBufferNext = 0;
+    struct DrawBindingsKey {
+        std::size_t allocation;
+        const Buffer* buffer;
+        std::uint64_t address;
+        bool operator==(const DrawBindingsKey&) const = default;
+    };
+    mutable std::vector<DrawBindingsKey> lastDrawBindingsKey;
+    mutable std::weak_ptr<DrawBindings> lastDrawBindings;
     mutable std::vector<VkDescriptorPoolSize> drawPoolSizes;
     // Guest buffer elements bound read-only: each use of this object skips that many pending-write
     // notes (counted in MarkGpuWrites for the [buffers] line).
