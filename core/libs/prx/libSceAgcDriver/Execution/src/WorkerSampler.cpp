@@ -304,8 +304,11 @@ void StartWorkerSampler() {
     if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &sampler->target, THREAD_ALL_ACCESS, FALSE, 0)) throw std::system_error(GetLastError(), std::system_category(), "Duplicating sampler thread handle");
     workerSamplerThread = std::jthread([sampler = std::move(sampler)](std::stop_token token) {
         auto flushed = std::chrono::steady_clock::now();
+        const auto delay = std::getenv("APS5_SAMPLE_DELAY") != nullptr ? std::chrono::seconds(std::atoi(std::getenv("APS5_SAMPLE_DELAY"))) : std::chrono::seconds(0);
+        const auto begun = std::chrono::steady_clock::now();
         while (!token.stop_requested()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            if (std::chrono::steady_clock::now() - begun < delay) continue;
             sampler->sample();
             if (std::chrono::steady_clock::now() - flushed > std::chrono::seconds(20)) {
                 sampler->write();
