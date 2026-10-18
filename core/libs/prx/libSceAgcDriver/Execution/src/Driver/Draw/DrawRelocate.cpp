@@ -8,6 +8,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <list>
+#include <mutex>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
 namespace AgcDriver::DriverDetail {
 
@@ -18,6 +23,54 @@ constexpr std::size_t MaxContentWords = 64;
 
 std::uint64_t AlignedWord(std::uint32_t word) {
     return word & ~std::uint32_t {3};
+}
+
+constexpr std::size_t MaxRebasedResults = 16384;
+
+using ShaderDataPatches = std::vector<std::pair<std::uint32_t, std::uint32_t>>;
+
+struct RebasedResult {
+    std::uint64_t hash = 0;
+    std::shared_ptr<const ShaderRecompiler::RecompileResult> source;
+    ShaderDataPatches patches;
+    std::shared_ptr<const ShaderRecompiler::RecompileResult> rebased;
+};
+
+struct RebasedResults {
+    std::mutex mutex;
+    std::list<RebasedResult> order;
+    std::unordered_multimap<std::uint64_t, std::list<RebasedResult>::iterator> index;
+};
+
+RebasedResults& Rebased() {
+    static RebasedResults results;
+    return results;
+}
+
+bool RebasedResultCache() {
+    static const bool enabled = std::getenv("APS5_NO_REBASED_RESULT_CACHE") == nullptr;
+    return enabled;
+}
+
+std::uint64_t RebasedHash(const ShaderRecompiler::RecompileResult* source, const ShaderDataPatches& patches) {
+    std::uint64_t hash = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(source)) * 0x9e3779b97f4a7c15ull;
+    for (const auto& [slot, value] : patches) {
+        hash ^= static_cast<std::uint64_t>(slot) << 32u | value;
+        hash *= 0x100000001b3ull;
+    }
+    return hash ^ hash >> 29u;
+}
+
+std::shared_ptr<const ShaderRecompiler::RecompileResult> Rebase(const ShaderRecompiler::RecompileResult& source, const ShaderDataPatches& patches) {
+    auto rebased = std::make_shared<ShaderRecompiler::RecompileResult>(source);
+    for (const auto& [slot, value] : patches) {
+        const auto at = static_cast<std::size_t>(slot) * sizeof(std::uint32_t);
+        if (at + sizeof(std::uint32_t) <= rebased->pushConstants.size()) std::memcpy(rebased->pushConstants.data() + at, &value, sizeof(value));
+        for (auto& binding : rebased->bindings) {
+            if (binding.role == ShaderRecompiler::DescriptorRole::ShaderData && slot < binding.guestDescriptor.size()) binding.guestDescriptor[slot] = value;
+        }
+    }
+    return rebased;
 }
 
 }
@@ -250,12 +303,39 @@ void Driver::relocateDrawEntry(const QueueState& queue, std::uint64_t alias, std
 
 void Driver::applyShaderDataPatches(DispatchVariant& variant) {
     if (variant.shaderDataPatches.empty()) return;
-    auto rebased = std::make_shared<ShaderRecompiler::RecompileResult>(*variant.compiled);
-    for (const auto& [slot, value] : variant.shaderDataPatches) {
-        const auto at = static_cast<std::size_t>(slot) * sizeof(std::uint32_t);
-        if (at + sizeof(std::uint32_t) <= rebased->pushConstants.size()) std::memcpy(rebased->pushConstants.data() + at, &value, sizeof(value));
-        for (auto& binding : rebased->bindings) {
-            if (binding.role == ShaderRecompiler::DescriptorRole::ShaderData && slot < binding.guestDescriptor.size()) binding.guestDescriptor[slot] = value;
+    if (!RebasedResultCache()) {
+        variant.compiled = Rebase(*variant.compiled, variant.shaderDataPatches);
+        variant.shaderDataPatches.clear();
+        return;
+    }
+    auto& cache = Rebased();
+    const auto hash = RebasedHash(variant.compiled.get(), variant.shaderDataPatches);
+    {
+        std::lock_guard lock(cache.mutex);
+        const auto [first, last] = cache.index.equal_range(hash);
+        for (auto found = first; found != last; ++found) {
+            const auto entry = found->second;
+            if (entry->source != variant.compiled || entry->patches != variant.shaderDataPatches) continue;
+            cache.order.splice(cache.order.begin(), cache.order, entry);
+            variant.compiled = entry->rebased;
+            variant.shaderDataPatches.clear();
+            return;
+        }
+    }
+    auto rebased = Rebase(*variant.compiled, variant.shaderDataPatches);
+    {
+        std::lock_guard lock(cache.mutex);
+        cache.order.push_front({hash, variant.compiled, variant.shaderDataPatches, rebased});
+        cache.index.emplace(hash, cache.order.begin());
+        while (cache.order.size() > MaxRebasedResults) {
+            const auto oldest = std::prev(cache.order.end());
+            const auto [first, last] = cache.index.equal_range(oldest->hash);
+            for (auto found = first; found != last; ++found) {
+                if (found->second != oldest) continue;
+                cache.index.erase(found);
+                break;
+            }
+            cache.order.erase(oldest);
         }
     }
     variant.compiled = std::move(rebased);
