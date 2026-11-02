@@ -2864,7 +2864,7 @@ bool compareBlock(const RefreshBlock& block) {
     const auto offset = static_cast<std::size_t>(block.address - block.mirror->base);
     const auto* guest = reinterpret_cast<const std::byte*>(block.address);
     if (block.mirror->resident != nullptr) {
-        auto* target = block.mirror->resident->Block(block.address);
+        auto* target = block.mirror->resident->Pending(block.address);
         if (block.fill == SparseZero) {
             if (target != nullptr) std::memset(target, 0, block.length);
             return true;
@@ -3028,7 +3028,7 @@ void bindHeapBlocks(std::span<const RefreshBlock> blocks) {
     std::vector<std::pair<ImageMirror*, GuestRuns>> wanted;
     for (const auto& block : blocks) {
         if (block.mirror->resident == nullptr || block.fill == SparseZero) continue;
-        if (block.mirror->resident->Block(block.address) == nullptr && GuestBytesZero(block.address, block.address + block.length)) continue;
+        if (!block.mirror->resident->Bound(block.address) && GuestBytesZero(block.address, block.address + block.length)) continue;
         if (wanted.empty() || wanted.back().first != block.mirror) {
             const auto found = std::find_if(wanted.begin(), wanted.end(), [&](const auto& entry) { return entry.first == block.mirror; });
             if (found == wanted.end()) wanted.emplace_back(block.mirror, GuestRuns{});
@@ -3047,9 +3047,20 @@ void bindHeapBlocks(std::span<const RefreshBlock> blocks) {
 void compareBlocks(std::span<const RefreshBlock> blocks) {
     if (blocks.empty()) return;
     bindHeapBlocks(blocks);
+    std::vector<std::pair<std::shared_ptr<ResidentBuffer>, GuestRuns>> written;
+    for (const auto& block : blocks) {
+        const auto& resident = block.mirror->resident;
+        if (resident == nullptr || !resident->Bound(block.address)) continue;
+        const auto found = std::find_if(written.begin(), written.end(), [&](const auto& entry) { return entry.first == resident; });
+        auto& runs = found != written.end() ? found->second : written.emplace_back(resident, GuestRuns{}).second;
+        runs.emplace_back(block.address, block.address + block.length);
+    }
+    std::vector<std::unique_ptr<ResidentBuffer::WriteScope>> scopes;
+    scopes.reserve(written.size());
+    for (const auto& [resident, runs] : written) scopes.push_back(std::make_unique<ResidentBuffer::WriteScope>(resident, runs));
     const auto copied = RefreshPool::Get().Run(blocks);
     for (const auto& block : blocks) {
-        if (block.mirror->resident != nullptr && block.mirror->resident->Block(block.address) != nullptr) block.mirror->resident->MarkChanged(block.address, block.address + block.length);
+        if (block.mirror->resident != nullptr && block.mirror->resident->Bound(block.address)) block.mirror->resident->MarkChanged(block.address, block.address + block.length);
     }
     auto& state = Mirrors();
     state.blocksCompared += blocks.size();
@@ -3378,10 +3389,11 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
     if (mirror->resident != nullptr) {
         {
             const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::MirrorRefresh);
+            const ResidentBuffer::WriteScope writes(mirror->resident, backed);
             for (const auto& [first, last] : backed) {
                 for (auto at = first; at < last;) {
                     const auto next = std::min(last, (at / ResidentBuffer::BlockBytes + 1) * ResidentBuffer::BlockBytes);
-                    GuestMemory::Read(at, std::span<std::byte>(mirror->resident->Block(at), static_cast<std::size_t>(next - at)));
+                    GuestMemory::Read(at, std::span<std::byte>(mirror->resident->Pending(at), static_cast<std::size_t>(next - at)));
                     at = next;
                 }
                 mirror->resident->MarkChanged(first / ResidentBuffer::BlockBytes * ResidentBuffer::BlockBytes, (last + ResidentBuffer::BlockBytes - 1) / ResidentBuffer::BlockBytes * ResidentBuffer::BlockBytes);
@@ -6652,11 +6664,13 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> mergeWrites(std::vector<std
 void GuestBufferMemory::releaseHeapReferences() noexcept {
     for (auto& reference : heapReferences) ReferenceStorage::Shared().Return(std::move(reference.second));
     heapReferences.clear();
+    heapReferenceBuffers.clear();
     heapReadbacks.clear();
 }
 
 void GuestBufferMemory::takeHeapReferences() {
     releaseHeapReferences();
+    std::vector<std::tuple<ImageMirror*, std::uint64_t, std::uint64_t>> resident;
     for (const auto& [begin, end] : mergeWrites(writes)) {
         const auto* found = owner(begin, end);
         if (found == nullptr || found->mirror == nullptr || !found->mirror->heap || !found->mirror->writable) continue;
@@ -6665,17 +6679,19 @@ void GuestBufferMemory::takeHeapReferences() {
         const auto served = std::min(end, servedEnd(*found));
         if (begin >= served) continue;
         growResident(mirror, {{begin, served}});
+        if (mirror.resident != nullptr) {
+            resident.emplace_back(&mirror, begin, served);
+            continue;
+        }
         const auto size = static_cast<std::size_t>(served - begin);
         auto storage = ReferenceStorage::Shared().Take(size);
-        if (mirror.resident != nullptr) {
-            storage.resize(size);
-            mirror.resident->Read(begin, storage);
-        } else {
-            const auto bytes = mirror.buffer->Bytes().subspan(static_cast<std::size_t>(begin - mirror.base), size);
-            storage.assign(bytes.begin(), bytes.end());
-        }
+        const auto bytes = mirror.buffer->Bytes().subspan(static_cast<std::size_t>(begin - mirror.base), size);
+        storage.assign(bytes.begin(), bytes.end());
         heapReferences.emplace_back(begin, std::move(storage));
     }
+    if (resident.empty()) return;
+    ResidentBuffer::FlushChanged(context);
+    for (const auto& [mirror, begin, served] : resident) heapReferenceBuffers.emplace_back(begin, mirror->resident->CaptureReference(begin, served - begin));
 }
 
 void GuestBufferMemory::WriteBack() {
@@ -6705,14 +6721,17 @@ void GuestBufferMemory::WriteBack() {
             if (mirror.heap && begin >= served) continue;
             const auto length = static_cast<std::size_t>((mirror.heap ? served : end) - begin);
             if (mirror.heap) {
-                const auto reference = std::find_if(heapReferences.begin(), heapReferences.end(), [&](const auto& entry) { return entry.first == begin; });
-                Require(reference != heapReferences.end() && reference->second.size() == length, "heap mirror write-back has no reference");
                 if (mirror.resident == nullptr) {
+                    const auto reference = std::find_if(heapReferences.begin(), heapReferences.end(), [&](const auto& entry) { return entry.first == begin; });
+                    Require(reference != heapReferences.end() && reference->second.size() == length, "heap mirror write-back has no reference");
                     const auto current = mirror.buffer->Bytes().subspan(offset, length);
                     if (mirror.sparse) storeSparse(mirror, begin, current, reference->second);
                     else storeChanged(begin, current, reference->second);
                     continue;
                 }
+                const auto reference = std::find_if(heapReferenceBuffers.begin(), heapReferenceBuffers.end(), [&](const auto& entry) { return entry.first == begin; });
+                Require(reference != heapReferenceBuffers.end() && reference->second->Bytes().size() >= length, "heap mirror write-back has no reference");
+                const std::span<const std::byte> original = reference->second->Bytes().first(length);
                 std::vector<std::byte> current(length);
                 if (const auto readback = std::find_if(heapReadbacks.begin(), heapReadbacks.end(), [&](const auto& entry) { return entry.first == begin; }); readback != heapReadbacks.end()) {
                     Require(readback->second->Bytes().size() == length, "heap mirror readback does not match its write-back");
@@ -6720,9 +6739,8 @@ void GuestBufferMemory::WriteBack() {
                 } else {
                     mirror.resident->ReadDevice(begin, current);
                 }
-                mirror.resident->Store(begin, current);
-                if (mirror.sparse) storeSparse(mirror, begin, current, reference->second);
-                else storeChanged(begin, current, reference->second);
+                if (mirror.sparse) storeSparse(mirror, begin, current, original);
+                else storeChanged(begin, current, original);
                 continue;
             }
             const auto current = mirror.buffer->Bytes().subspan(offset, length);

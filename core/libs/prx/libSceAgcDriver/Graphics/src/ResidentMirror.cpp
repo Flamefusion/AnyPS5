@@ -76,7 +76,6 @@ class ResidentMemory {
 public:
     struct Slab {
         VkDeviceMemory memory = VK_NULL_HANDLE;
-        std::unique_ptr<std::byte[]> host;
         std::vector<std::uint32_t> free;
     };
 
@@ -123,7 +122,6 @@ public:
         }
         auto slab = std::make_unique<Slab>();
         slab->memory = allocate(SlabBytes, "vkAllocateMemory of a heap mirror slab");
-        slab->host = std::unique_ptr<std::byte[]>(new std::byte[SlabBytes]);
         for (std::uint32_t index = SlabBlocks; index-- > 1;) slab->free.push_back(index);
         slabs.push_back(std::move(slab));
         return {slabs.back().get(), 0u};
@@ -168,6 +166,8 @@ struct ResidentDevices {
     std::mutex pendingMutex;
     std::vector<std::weak_ptr<ResidentBuffer>> pending;
 };
+
+std::atomic<std::uint64_t> pendingBytes{0};
 
 ResidentDevices& Devices() {
     static ResidentDevices devices;
@@ -341,6 +341,10 @@ GuestRuns GuestNonzeroBlocks(const GuestRuns& candidates) {
     return runs;
 }
 
+std::uint64_t ResidentPendingBytes() {
+    return pendingBytes.load(std::memory_order_relaxed);
+}
+
 void SetResidentAddressSpaceLimit(std::uint64_t bytes) {
     auto& devices = Devices();
     std::lock_guard lock(devices.mutex);
@@ -397,8 +401,8 @@ ResidentBuffer::ResidentBuffer(const Context& context, std::uint64_t base, std::
         for (std::size_t index = 0; index < slots.size();) {
             if (wanted[index]) {
                 auto [slab, at] = memory->Take();
-                slots[index] = {slab, at, slab->host.get() + at * BlockSize};
-                std::memset(slots[index].host, 0, static_cast<std::size_t>(BlockSize));
+                slots[index].slab = slab;
+                slots[index].index = at;
                 binds.push_back({index * BlockSize, BlockSize, slab->memory, at * BlockSize, 0});
                 ++bound;
                 ++index;
@@ -427,9 +431,11 @@ void ResidentBuffer::release() noexcept {
     if (buffer != VK_NULL_HANDLE) context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, buffer, nullptr);
     buffer = VK_NULL_HANDLE;
     for (auto& slot : slots) {
-        if (slot.host != nullptr) memory->Put(static_cast<ResidentMemory::Slab*>(slot.slab), slot.index);
+        if (slot.slab != nullptr) memory->Put(static_cast<ResidentMemory::Slab*>(slot.slab), slot.index);
         slot = {};
     }
+    pendingBytes.fetch_sub(static_cast<std::uint64_t>(pendingSlots.size()) * BlockSize, std::memory_order_relaxed);
+    pendingSlots.clear();
     auto& devices = Devices();
     std::lock_guard lock(devices.mutex);
     if (const auto found = devices.addressSpace.find(context.device); found != devices.addressSpace.end()) found->second -= std::min(found->second, size);
@@ -441,9 +447,53 @@ std::size_t ResidentBuffer::blockIndex(std::uint64_t guest) const {
     return static_cast<std::size_t>((guest - origin) / BlockSize);
 }
 
-std::byte* ResidentBuffer::Block(std::uint64_t guest) const {
+bool ResidentBuffer::Bound(std::uint64_t guest) const {
+    return slots[blockIndex(guest)].slab != nullptr;
+}
+
+std::byte* ResidentBuffer::Pending(std::uint64_t guest) const {
     const auto& slot = slots[blockIndex(guest)];
-    return slot.host == nullptr ? nullptr : slot.host + (guest - origin) % BlockSize;
+    return slot.pending == nullptr ? nullptr : slot.pending.get() + (guest - origin) % BlockSize;
+}
+
+ResidentBuffer::WriteScope::WriteScope(std::shared_ptr<ResidentBuffer> held, const GuestRuns& runs) : buffer(std::move(held)) {
+    buffer->beginWrites(runs);
+}
+
+ResidentBuffer::WriteScope::~WriteScope() {
+    buffer->endWrites();
+}
+
+void ResidentBuffer::beginWrites(const GuestRuns& runs) {
+    std::lock_guard lock(pendingMutex);
+    for (const auto& [first, last] : runs) {
+        if (first >= last) continue;
+        for (auto index = blockIndex(first); index <= blockIndex(last - 1); ++index) {
+            auto& slot = slots[index];
+            if (slot.slab == nullptr || slot.pending != nullptr) continue;
+            slot.pending = std::make_unique<std::byte[]>(static_cast<std::size_t>(BlockSize));
+            pendingSlots.push_back(index);
+            pendingBytes.fetch_add(BlockSize, std::memory_order_relaxed);
+        }
+    }
+    ++writers;
+}
+
+void ResidentBuffer::endWrites() noexcept {
+    std::lock_guard lock(pendingMutex);
+    --writers;
+    if (writers != 0) return;
+    {
+        std::lock_guard changes(changedMutex);
+        if (!changed.empty()) return;
+    }
+    releasePending();
+}
+
+void ResidentBuffer::releasePending() noexcept {
+    for (const auto index : pendingSlots) slots[index].pending.reset();
+    pendingBytes.fetch_sub(static_cast<std::uint64_t>(pendingSlots.size()) * BlockSize, std::memory_order_relaxed);
+    pendingSlots.clear();
 }
 
 std::uint64_t ResidentBuffer::UnboundBytes(const GuestRuns& runs) const {
@@ -451,7 +501,7 @@ std::uint64_t ResidentBuffer::UnboundBytes(const GuestRuns& runs) const {
     for (const auto& [first, last] : runs) {
         if (first >= last) continue;
         for (auto index = blockIndex(first); index <= blockIndex(last - 1); ++index) {
-            if (slots[index].host == nullptr) seen.push_back(index);
+            if (slots[index].slab == nullptr) seen.push_back(index);
         }
     }
     std::sort(seen.begin(), seen.end());
@@ -464,10 +514,10 @@ void ResidentBuffer::Bind(const GuestRuns& runs) {
     for (const auto& [first, last] : runs) {
         if (first >= last) continue;
         for (auto index = blockIndex(first); index <= blockIndex(last - 1); ++index) {
-            if (slots[index].host != nullptr) continue;
+            if (slots[index].slab != nullptr) continue;
             auto [slab, at] = memory->Take();
-            slots[index] = {slab, at, slab->host.get() + at * BlockSize};
-            std::memset(slots[index].host, 0, static_cast<std::size_t>(BlockSize));
+            slots[index].slab = slab;
+            slots[index].index = at;
             binds.push_back({index * BlockSize, BlockSize, slab->memory, at * BlockSize, 0});
             made.push_back(index);
         }
@@ -479,7 +529,8 @@ void ResidentBuffer::Bind(const GuestRuns& runs) {
     } catch (...) {
         for (const auto index : made) {
             memory->Put(static_cast<ResidentMemory::Slab*>(slots[index].slab), slots[index].index);
-            slots[index] = {};
+            slots[index].slab = nullptr;
+            slots[index].index = 0;
         }
         throw;
     }
@@ -502,28 +553,13 @@ void ResidentBuffer::MarkChanged(std::uint64_t begin, std::uint64_t end) {
     devices.pending.push_back(weak_from_this());
 }
 
-void ResidentBuffer::Read(std::uint64_t guest, std::span<std::byte> out) const {
-    std::size_t done = 0;
-    while (done < out.size()) {
-        const auto at = guest + done;
-        const auto within = static_cast<std::size_t>((at - origin) % BlockSize);
-        const auto length = std::min<std::size_t>(out.size() - done, static_cast<std::size_t>(BlockSize) - within);
-        if (const auto* source = Block(at); source != nullptr) std::memcpy(out.data() + done, source, length);
-        else std::memset(out.data() + done, 0, length);
-        done += length;
-    }
-}
-
-void ResidentBuffer::Store(std::uint64_t guest, std::span<const std::byte> bytes) {
-    std::size_t done = 0;
-    while (done < bytes.size()) {
-        const auto at = guest + done;
-        const auto within = static_cast<std::size_t>((at - origin) % BlockSize);
-        const auto length = std::min<std::size_t>(bytes.size() - done, static_cast<std::size_t>(BlockSize) - within);
-        if (auto* target = Block(at); target != nullptr) std::memcpy(target, bytes.data() + done, length);
-        else Require(GuestBytesZero(reinterpret_cast<std::uintptr_t>(bytes.data() + done), reinterpret_cast<std::uintptr_t>(bytes.data() + done + length)), "the GPU wrote a heap mirror block that holds no memory");
-        done += length;
-    }
+std::shared_ptr<Buffer> ResidentBuffer::CaptureReference(std::uint64_t guest, std::uint64_t bytes) const {
+    std::shared_ptr<Buffer> staging;
+    recordTransfer(context, [&](VkCommandBuffer commands, std::vector<std::shared_ptr<void>>& kept) {
+        staging = RecordReadback(commands, guest, bytes);
+        kept.push_back(staging);
+    });
+    return staging;
 }
 
 std::shared_ptr<Buffer> ResidentBuffer::RecordReadback(VkCommandBuffer commands, std::uint64_t guest, std::uint64_t bytes) const {
@@ -549,71 +585,83 @@ std::shared_ptr<Buffer> ResidentBuffer::readbackBatch(std::uint64_t guest, std::
     return staging;
 }
 
+void ResidentBuffer::upload(GuestRuns& runs) {
+    std::sort(runs.begin(), runs.end());
+    std::vector<VkBufferCopy> regions;
+    std::uint64_t total = 0;
+    std::uint64_t cursor = 0;
+    for (const auto& [first, last] : runs) {
+        for (auto at = std::max(first, cursor); at < last;) {
+            const auto next = std::min(last, (at / BlockSize + 1) * BlockSize);
+            if (slots[blockIndex(at)].slab != nullptr) {
+                if (!regions.empty() && regions.back().dstOffset + regions.back().size == at - origin) regions.back().size += next - at;
+                else regions.push_back({total, at - origin, next - at});
+                total += next - at;
+            }
+            at = next;
+        }
+        cursor = std::max(cursor, last);
+    }
+    if (regions.empty()) return;
+    struct Chunk {
+        std::shared_ptr<Buffer> staging;
+        std::vector<VkBufferCopy> copies;
+    };
+    std::vector<Chunk> chunks;
+    VkDeviceSize filled = StagingChunkBytes;
+    std::unique_lock pendingLock(pendingMutex);
+    for (const auto& region : regions) {
+        for (VkDeviceSize done = 0; done < region.size;) {
+            if (filled == StagingChunkBytes) {
+                const auto remaining = total - (region.srcOffset + done);
+                chunks.push_back({std::make_shared<Buffer>(context, static_cast<std::size_t>(std::min(StagingChunkBytes, remaining)), VK_BUFFER_USAGE_TRANSFER_SRC_BIT), {}});
+                filled = 0;
+            }
+            auto& chunk = chunks.back();
+            const auto at = origin + region.dstOffset + done;
+            const auto length = std::min({region.size - done, BlockSize - (at - origin) % BlockSize, StagingChunkBytes - filled});
+            if (const auto* source = Pending(at); source != nullptr) std::memcpy(chunk.staging->Bytes().data() + filled, source, static_cast<std::size_t>(length));
+            else std::memset(chunk.staging->Bytes().data() + filled, 0, static_cast<std::size_t>(length));
+            if (!chunk.copies.empty() && chunk.copies.back().srcOffset + chunk.copies.back().size == filled && chunk.copies.back().dstOffset + chunk.copies.back().size == region.dstOffset + done) chunk.copies.back().size += length;
+            else chunk.copies.push_back({filled, region.dstOffset + done, length});
+            filled += length;
+            done += length;
+        }
+    }
+    pendingLock.unlock();
+    recordTransfer(context, [&](VkCommandBuffer commands, std::vector<std::shared_ptr<void>>& kept) {
+        for (const auto& chunk : chunks) {
+            context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(commands, chunk.staging->Handle(), buffer, static_cast<std::uint32_t>(chunk.copies.size()), chunk.copies.data());
+            kept.push_back(chunk.staging);
+        }
+        kept.push_back(shared_from_this());
+    });
+}
+
 void ResidentBuffer::flush() {
+    {
+        std::lock_guard lock(pendingMutex);
+        ++writers;
+    }
     GuestRuns runs;
     {
         std::lock_guard lock(changedMutex);
         runs.swap(changed);
     }
-    if (runs.empty()) return;
     try {
-        std::sort(runs.begin(), runs.end());
-        std::vector<VkBufferCopy> regions;
-        std::uint64_t total = 0;
-        std::uint64_t cursor = 0;
-        for (const auto& [first, last] : runs) {
-            for (auto at = std::max(first, cursor); at < last;) {
-                const auto next = std::min(last, (at / BlockSize + 1) * BlockSize);
-                if (slots[blockIndex(at)].host != nullptr) {
-                    if (!regions.empty() && regions.back().dstOffset + regions.back().size == at - origin) regions.back().size += next - at;
-                    else regions.push_back({total, at - origin, next - at});
-                    total += next - at;
-                }
-                at = next;
-            }
-            cursor = std::max(cursor, last);
-        }
-        if (regions.empty()) return;
-        struct Chunk {
-            std::shared_ptr<Buffer> staging;
-            std::vector<VkBufferCopy> copies;
-        };
-        std::vector<Chunk> chunks;
-        VkDeviceSize filled = StagingChunkBytes;
-        for (const auto& region : regions) {
-            for (VkDeviceSize done = 0; done < region.size;) {
-                if (filled == StagingChunkBytes) {
-                    const auto remaining = total - (region.srcOffset + done);
-                    chunks.push_back({std::make_shared<Buffer>(context, static_cast<std::size_t>(std::min(StagingChunkBytes, remaining)), VK_BUFFER_USAGE_TRANSFER_SRC_BIT), {}});
-                    filled = 0;
-                }
-                auto& chunk = chunks.back();
-                const auto at = origin + region.dstOffset + done;
-                const auto length = std::min({region.size - done, BlockSize - (at - origin) % BlockSize, StagingChunkBytes - filled});
-                std::memcpy(chunk.staging->Bytes().data() + filled, Block(at), static_cast<std::size_t>(length));
-                if (!chunk.copies.empty() && chunk.copies.back().srcOffset + chunk.copies.back().size == filled && chunk.copies.back().dstOffset + chunk.copies.back().size == region.dstOffset + done) chunk.copies.back().size += length;
-                else chunk.copies.push_back({filled, region.dstOffset + done, length});
-                filled += length;
-                done += length;
-            }
-        }
-        recordTransfer(context, [&](VkCommandBuffer commands, std::vector<std::shared_ptr<void>>& kept) {
-            for (const auto& chunk : chunks) {
-                context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(commands, chunk.staging->Handle(), buffer, static_cast<std::uint32_t>(chunk.copies.size()), chunk.copies.data());
-                kept.push_back(chunk.staging);
-            }
-            kept.push_back(shared_from_this());
-        });
+        if (!runs.empty()) upload(runs);
     } catch (...) {
         {
             std::lock_guard lock(changedMutex);
             changed.insert(changed.begin(), runs.begin(), runs.end());
         }
+        endWrites();
         auto& devices = Devices();
         std::lock_guard lock(devices.pendingMutex);
         devices.pending.push_back(weak_from_this());
         throw;
     }
+    endWrites();
 }
 
 void ResidentBuffer::FlushChanged(const Context& context) {

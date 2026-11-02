@@ -259,6 +259,11 @@ void CheckHeld(std::uint64_t before, std::uint64_t written, const std::string& s
     Require(held == written, "resident heap mirror: " + step + ": the heap mirrors of two " + std::to_string(HeapBytes >> 10u) + " KiB heaps hold " + std::to_string(held >> 10u) + " KiB of device memory; the guest and the GPU wrote " + std::to_string(written >> 10u) + " KiB of them");
 }
 
+void CheckReleased(const std::string& step) {
+    const auto pending = AgcDriver::Graphics::ResidentPendingBytes();
+    Require(pending == 0, "resident heap mirror: " + step + ": " + std::to_string(pending >> 10u) + " KiB of host upload blocks are still held after the upload was flushed");
+}
+
 void ResidentTests(AgcDriver::VulkanDevice& device) {
     GuestHeap read(false);
     GuestHeap written(true);
@@ -273,18 +278,21 @@ void ResidentTests(AgcDriver::VulkanDevice& device) {
     CheckHeld(before.heapBytes, 3 * Block, "first dispatch");
     CheckReads(output, "first dispatch", false);
     CheckStores(written, "first dispatch");
+    CheckReleased("first dispatch");
     Require(written.Load(16) == 0x77u, "resident heap mirror: the written heap's guest bytes changed");
     read.Store(LateThread * ThreadStride, Pattern(LateThread));
     std::memset(read.Data() + ZeroedBlock, 0, Block);
     Dispatch(device, read, written, output);
     CheckHeld(before.heapBytes, 4 * Block, "after a guest write into a never-written block and zeros written into another");
     CheckReads(output, "after a guest write into a never-written block", true);
+    CheckReleased("after a guest write into a never-written block");
     const auto steady = AgcDriver::Graphics::MirrorCounters();
     Dispatch(device, read, written, output);
     const auto again = AgcDriver::Graphics::MirrorCounters();
     Require(again.rebuilds == steady.rebuilds && again.heapBytes == steady.heapBytes, "resident heap mirror: an unchanged dispatch rebuilt or grew the heap mirrors");
     CheckReads(output, "unchanged dispatch", true);
     CheckStores(written, "unchanged dispatch");
+    CheckReleased("unchanged dispatch");
 }
 
 void StagingChunkTests(AgcDriver::VulkanDevice& device) {
