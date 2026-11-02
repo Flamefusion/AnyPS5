@@ -326,6 +326,71 @@ std::uint32_t EmittedEvaluationControlPoint(std::uint32_t address) {
     return EmittedControlPoint(IrShaderStage::TessellationEvaluation, TessellationAttribute::EvaluationInput, address);
 }
 
+struct Domain {
+    IrProgram program;
+    IrBuilder builder{program};
+    IrValue* primitive = nullptr;
+
+    Domain() {
+        program.Resources().stage = IrShaderStage::TessellationEvaluation;
+        IrBlock& entry = block();
+        program.SetEntryBlock(entry);
+        builder.SetInsertionPoint(entry);
+        primitive = &builder.Emit(IrOpcode::TessellationBase, IrType::U32, {&builder.Constant(static_cast<std::uint32_t>(TessellationBaseKind::PassthroughPrimitive))});
+        exportWords(ExportTargetKind::Primitive, 20u, 1u, *primitive, 0x28u);
+    }
+
+    IrBlock& block() {
+        auto& created = program.CreateBlock();
+        program.BlockOrder().push_back(&created);
+        BlockInfo info;
+        info.id = created.Id();
+        program.Metadata().blockInfo.push_back(info);
+        return created;
+    }
+
+    void exportWords(ExportTargetKind kind, std::uint32_t target, std::uint32_t en, IrValue& first, std::uint32_t pc) {
+        auto& data = builder.Emit(IrOpcode::CompositeConstructU32x4, IrType::U32x4, {&first, &builder.Constant(0u), &builder.Constant(0u), &builder.Constant(0u)});
+        const auto index = static_cast<std::uint32_t>(program.Metadata().exportInfo.size());
+        program.Metadata().exportInfo.push_back(ExportInfo{.kind = kind, .target = target, .en = en});
+        static_cast<void>(builder.Emit(IrOpcode::SetAttribute, IrType::Void, {&data, &builder.GetExec()}, ExportFlags{index, pc}));
+    }
+
+    void exportPrimitiveOnSkipPath() {
+        IrBlock& entry = *program.BlockOrder().front();
+        IrBlock& work = block();
+        IrBlock& exports = block();
+        auto& point = builder.Emit(IrOpcode::GetBuiltin, IrType::U32, {&builder.Constant(static_cast<std::uint32_t>(StageInputKind::PrimitiveId)), &builder.Constant(0u)});
+        builder.BranchConditional(builder.Emit(IrOpcode::ULessThan32, IrType::Bool, {&point, &builder.Constant(1u)}), exports, work);
+        builder.SetInsertionPoint(work);
+        auto& computed = builder.IAdd(point, builder.Constant(7u));
+        builder.Branch(exports);
+        builder.SetInsertionPoint(exports);
+        auto& merged = builder.Emit(IrOpcode::Phi, IrType::U32, {});
+        merged.AddPhiOperand(&entry, primitive);
+        merged.AddPhiOperand(&work, &computed);
+        exportWords(ExportTargetKind::Parameter, 37u, 0xfu, merged, 0x55cu);
+    }
+
+    bool parameterReadsPrimitive() const {
+        for (IrBlock* current : program.BlockOrder()) {
+            for (IrValue* inst : current->Instructions()) {
+                if (inst->Opcode() != IrOpcode::SetAttribute) continue;
+                const IrValue* data = inst->Argument(0)->Resolve();
+                for (std::size_t at = 0; at < data->ArgumentCount(); ++at) {
+                    const IrValue* word = data->Argument(at)->Resolve();
+                    if (word->Opcode() == IrOpcode::TessellationBase) return true;
+                    if (word->Opcode() != IrOpcode::Phi) continue;
+                    for (std::size_t operand = 0; operand < word->ArgumentCount(); ++operand) {
+                        if (word->Argument(operand)->Resolve()->Opcode() == IrOpcode::TessellationBase) return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+};
+
 enum class Conjunction { None, Before, After };
 
 bool LowersUnderComplementedBallot(Conjunction conjunction) {
@@ -368,6 +433,14 @@ bool run(const char* name, const std::function<bool()>& body) {
 
 int main() {
     bool passed = true;
+
+    passed &= run("a domain program that exports its primitive VGPR as a parameter on a skip path exports 0 there", [] {
+        Domain domain;
+        domain.exportPrimitiveOnSkipPath();
+        const Outcome outcome = Lower(domain.program);
+        if (!outcome.lowered) std::fprintf(stderr, "refused: %s\n", outcome.reason.c_str());
+        return outcome.lowered && !domain.parameterReadsPrimitive();
+    });
 
     passed &= run("a hull read at a computed control-point index keeps the program's address", [] {
         Hull hull;

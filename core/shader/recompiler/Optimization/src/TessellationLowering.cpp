@@ -796,6 +796,7 @@ public:
         deadCodeEliminator.Eliminate(program);
         if (stage == IrShaderStage::TessellationControl) removeUnobservedCycles();
         std::vector<IrValue*> relative;
+        std::vector<IrValue*> primitive;
         for (IrBlock* block : program.BlockOrder()) {
             for (IrValue* inst : block->Instructions()) {
                 if (stage == IrShaderStage::TessellationControl && inst->Opcode() == IrOpcode::Ballot && inst->HasUses()) Fail("the hull program uses a lane mask other than its own lane's bit", 0u);
@@ -804,10 +805,14 @@ public:
                     relative.push_back(inst);
                     continue;
                 }
-                if (IsBase(inst, TessellationBaseKind::PassthroughPrimitive)) Fail("the primitive VGPR is used other than as the passthrough primitive export", 0u);
+                if (IsBase(inst, TessellationBaseKind::PassthroughPrimitive)) {
+                    primitive.push_back(inst);
+                    continue;
+                }
                 Fail("a tessellation ring base is used outside a lowered ring access", 0u);
             }
         }
+        for (IrValue* base : primitive) base->ReplaceAllUsesWith(&constant(0u));
         const bool data = usedAsData(relative);
         if (data) requireGroupedPatches();
         if (data) keepComputedReadsInPatch(*relative.front());
